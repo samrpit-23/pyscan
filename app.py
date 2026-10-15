@@ -116,6 +116,3 @@ def render():
     st.dataframe(df.style.map(color, subset=["Change %"]),
                  use_container_width=True, hide_index=True)
     st.caption("Data from Yahoo Finance (may be delayed). Not investment advice.")
-
-
-st.fragment(run_every=refresh)(render)()
