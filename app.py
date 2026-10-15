@@ -1,31 +1,44 @@
 """
 Nifty 500 - N-minute mover screener (Streamlit, mobile friendly)
-Deploy free on Streamlit Community Cloud, then open the link on your phone.
+Works live during market hours, and after close shows the last session's final N minutes.
 """
-
+ 
 import io
-from datetime import datetime
-
+ 
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-
+ 
 st.set_page_config(page_title="Nifty 500 Movers", page_icon="📈", layout="centered")
-
+ 
 NSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 CHUNK = 100
 IST = "Asia/Kolkata"
-
+ 
+ 
+def is_market_open():
+    now = pd.Timestamp.now(tz=IST)
+    return now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30)
+ 
+ 
+market_open = is_market_open()
+ 
 # ---------------- sidebar settings ----------------
 st.sidebar.header("Settings")
 threshold = st.sidebar.number_input("Min move %", 0.1, 20.0, 1.0, 0.1)
 window = st.sidebar.number_input("Window (minutes)", 1, 30, 3, 1)
 only_up = st.sidebar.checkbox("Only gainers", False)
-max_stale = st.sidebar.number_input("Ignore data older than (min)", 1, 30, 5, 1)
-refresh = st.sidebar.selectbox("Auto refresh (sec)", [30, 60, 120, 300], index=1)
-
-
+max_stale = st.sidebar.number_input("Ignore data older than (min, live only)", 1, 30, 5, 1)
+ 
+st.sidebar.divider()
+auto_refresh = st.sidebar.toggle("Auto refresh", value=True,
+                                 help="Only runs while the market is open.")
+refresh_sec = st.sidebar.selectbox("Refresh every (sec)", [30, 60, 120, 300], index=1)
+if st.sidebar.button("🔄 Refresh now", use_container_width=True):
+    st.cache_data.clear()
+ 
+ 
 # ---------------- data ----------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_symbols():
@@ -33,16 +46,19 @@ def load_symbols():
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     return [s.strip() + ".NS" for s in df["Symbol"].dropna()]
-
-
+ 
+ 
 @st.cache_data(ttl=45, show_spinner=False)
-def scan(symbols: tuple, threshold: float, window: int, only_up: bool, max_stale: int):
+def scan(symbols: tuple, threshold: float, window: int, only_up: bool,
+         max_stale: int, live: bool):
     rows = []
     now = pd.Timestamp.now(tz=IST)
+    period = "1d" if live else "5d"   # after close / weekends, grab a few days to find last session
+ 
     for i in range(0, len(symbols), CHUNK):
         chunk = list(symbols[i:i + CHUNK])
         try:
-            data = yf.download(chunk, period="1d", interval="1m", group_by="ticker",
+            data = yf.download(chunk, period=period, interval="1m", group_by="ticker",
                                threads=True, progress=False, auto_adjust=False)
         except Exception:
             continue
@@ -53,9 +69,15 @@ def scan(symbols: tuple, threshold: float, window: int, only_up: bool, max_stale
                 close = data[sym]["Close"].dropna()
                 if len(close) < 2:
                     continue
-                last_ts, last_price = close.index[-1], close.iloc[-1]
-                if (now - last_ts).total_seconds() / 60 > max_stale:
+                # keep only the most recent trading session
+                close = close[close.index.date == close.index[-1].date()]
+                if len(close) < 2:
                     continue
+ 
+                last_ts, last_price = close.index[-1], close.iloc[-1]
+                if live and (now - last_ts).total_seconds() / 60 > max_stale:
+                    continue
+ 
                 past = close[close.index <= last_ts - pd.Timedelta(minutes=window)]
                 if past.empty:
                     continue
@@ -68,14 +90,15 @@ def scan(symbols: tuple, threshold: float, window: int, only_up: bool, max_stale
                         "Change %": round(float(pct), 2),
                         "Prev": round(float(past_price), 2),
                         "Time": last_ts.strftime("%H:%M"),
+                        "Date": last_ts.strftime("%d %b"),
                     })
             except (KeyError, IndexError):
                 continue
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("Change %", key=abs, ascending=False).reset_index(drop=True)
-
-
+ 
+ 
 # ---------------- symbols ----------------
 try:
     symbols = load_symbols()
@@ -85,34 +108,40 @@ except Exception:
     if not up:
         st.stop()
     symbols = [s.strip() + ".NS" for s in pd.read_csv(up)["Symbol"].dropna()]
-
-
+ 
+ 
 # ---------------- UI ----------------
 st.title("📈 Nifty 500 Movers")
-
-
+ 
+ 
 def render():
     now = pd.Timestamp.now(tz=IST)
-    market_open = now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30)
-    st.caption(f"{now:%d %b %Y, %H:%M:%S} IST · "
-               f"{'🟢 Market open' if market_open else '🔴 Market closed'} · "
-               f"≥{threshold}% in {window} min")
-
+    live = is_market_open()
+    status = "🟢 Market open (live)" if live else "🔴 Market closed (last session)"
+    refresh_note = f" · auto refresh {refresh_sec}s" if (auto_refresh and live) else " · auto refresh off"
+    st.caption(f"{now:%d %b %Y, %H:%M:%S} IST · {status}{refresh_note}")
+    st.caption(f"≥{threshold}% move in the last {window} min"
+               + ("" if live else " of the last trading session"))
+ 
     with st.spinner("Scanning 500 stocks..."):
-        df = scan(tuple(symbols), threshold, window, only_up, max_stale)
-
+        df = scan(tuple(symbols), threshold, window, only_up, max_stale, live)
+ 
     if df.empty:
-        st.info("No stocks matched right now." if market_open
-                else "Market is closed, so there is no fresh data.")
+        st.info("No stocks matched. Try a lower % or a longer window.")
         return
-
+ 
     c1, c2 = st.columns(2)
     c1.metric("Gainers", int((df["Change %"] > 0).sum()))
     c2.metric("Losers", int((df["Change %"] < 0).sum()))
-
+ 
     def color(v):
         return "color: #16a34a" if v > 0 else "color: #dc2626"
-
+ 
     st.dataframe(df.style.map(color, subset=["Change %"]),
                  use_container_width=True, hide_index=True)
     st.caption("Data from Yahoo Finance (may be delayed). Not investment advice.")
+ 
+ 
+# auto refresh only while the market is open and the toggle is on
+run_every = refresh_sec if (auto_refresh and market_open) else None
+st.fragment(run_every=run_every)(render)()
